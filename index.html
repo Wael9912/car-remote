@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#101418">
 <title>Car Remote</title>
 <style>
   :root {
@@ -10,22 +11,23 @@
     --accent: #3fa7ff; --go: #2ecc71; --warn: #f5b041; --stop: #ef4b4b;
   }
   * { box-sizing: border-box; }
+  html, body { overscroll-behavior: none; }
   body {
     margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
-    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    display: flex; justify-content: center; padding: 24px 16px;
-    user-select: none; -webkit-user-select: none;
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; justify-content: center; padding: 16px;
+    user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent;
   }
-  main { width: 100%; max-width: 440px; display: grid; gap: 16px; }
+  main { width: 100%; max-width: 440px; display: grid; gap: 14px; align-content: start; }
   header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   h1 { font-size: 20px; margin: 0; }
   .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--stop); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--stop); flex: none; }
   .dot.on { background: var(--go); box-shadow: 0 0 8px var(--go); }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
   button {
     font: inherit; color: var(--text); background: #232b34; border: 1px solid var(--line);
-    border-radius: 12px; cursor: pointer; touch-action: none;
+    border-radius: 12px; cursor: pointer; touch-action: manipulation;
   }
   button:disabled { opacity: .4; cursor: not-allowed; }
   .connect { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -34,29 +36,58 @@
 
   .distance { display: grid; gap: 8px; }
   .distance .row { display: flex; justify-content: space-between; align-items: baseline; }
-  .distance .label { color: var(--muted); font-size: 13px; }
-  #cm { font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
-  #cm small { font-size: 15px; color: var(--muted); font-weight: 400; margin-left: 4px; }
-  .bar { height: 10px; background: #0c1014; border-radius: 6px; overflow: hidden; }
+  .label { color: var(--muted); font-size: 13px; }
+  #cm { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  #cm small { font-size: 14px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .bar { height: 8px; background: #0c1014; border-radius: 6px; overflow: hidden; }
   #bar { height: 100%; width: 0; background: var(--go); transition: width .1s, background .2s; }
   #warning { color: var(--stop); font-size: 13px; min-height: 18px; }
 
-  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-  .pad button { aspect-ratio: 1; font-size: 30px; }
-  .pad button.held { background: var(--accent); border-color: var(--accent); color: #06121e; }
-  .pad #stopBtn { background: var(--stop); border-color: var(--stop); font-size: 16px; font-weight: 700; }
+  .drive { display: grid; justify-items: center; gap: 12px; }
+  .stick {
+    position: relative; width: min(78vw, 300px); aspect-ratio: 1; border-radius: 50%;
+    background: radial-gradient(circle, #1f2730 0%, #151b21 70%);
+    border: 2px solid var(--line); touch-action: none; cursor: grab;
+  }
+  .stick::before, .stick::after {
+    content: ""; position: absolute; background: var(--line); left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .stick::before { width: 2px; height: 86%; }
+  .stick::after { width: 86%; height: 2px; }
+  .stick .label-f, .stick .label-b {
+    position: absolute; left: 50%; transform: translateX(-50%); color: var(--muted); font-size: 11px; letter-spacing: .08em;
+  }
+  .stick .label-f { top: 6px; }
+  .stick .label-b { bottom: 6px; }
+  .knob {
+    position: absolute; left: 50%; top: 50%; width: 36%; aspect-ratio: 1; border-radius: 50%;
+    margin: -18% 0 0 -18%; z-index: 1; pointer-events: none;
+    background: radial-gradient(circle at 35% 30%, #6cbcff, var(--accent) 55%, #1f6fb8);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .5);
+  }
+  .knob.home { transition: transform .15s ease-out; }
+  .stick.disabled { opacity: .35; cursor: not-allowed; }
 
-  .speed { display: grid; gap: 8px; }
-  .speed .row { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; }
-  #speedVal { color: var(--text); font-weight: 600; }
-  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .motors { width: 100%; display: grid; grid-template-columns: auto 1fr auto; gap: 6px 10px; align-items: center; font-size: 12px; color: var(--muted); }
+  .mbar { position: relative; height: 8px; background: #0c1014; border-radius: 6px; overflow: hidden; }
+  .mbar span { position: absolute; top: 0; bottom: 0; left: 50%; width: 0; background: var(--go); }
+  .motors output { font-variant-numeric: tabular-nums; min-width: 4ch; text-align: right; color: var(--text); }
 
-  #autoBtn { width: 100%; padding: 14px; font-weight: 600; }
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .actions button { padding: 16px 10px; font-weight: 700; }
+  #stopBtn { background: var(--stop); border-color: var(--stop); color: #fff; font-size: 17px; }
   #autoBtn.on { background: var(--warn); border-color: var(--warn); color: #1d1400; }
 
-  .hint { color: var(--muted); font-size: 12px; text-align: center; }
+  .speed { display: grid; gap: 8px; }
+  .speed .row { display: flex; justify-content: space-between; }
+  #speedVal { color: var(--text); font-weight: 600; }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 28px; }
+
+  .hint { color: var(--muted); font-size: 12px; text-align: center; margin: 0; }
   kbd { background: #232b34; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font: 11px ui-monospace, monospace; }
-  #unsupported { color: var(--warn); }
+  #unsupported { color: var(--warn); margin: 0; }
+  @media (pointer: coarse) { .keys { display: none; } }
 </style>
 </head>
 <body>
@@ -66,7 +97,7 @@
     <div class="status"><span class="dot" id="dot"></span><span id="statusText">Not connected</span></div>
   </header>
 
-  <p id="unsupported" hidden>This browser can't talk to the car. Open this page in Google Chrome.</p>
+  <p id="unsupported" hidden>This browser can't talk to the car. Use Chrome (Android, Mac or Windows).</p>
 
   <div class="connect">
     <button id="connectBt">Connect by Bluetooth</button>
@@ -80,50 +111,58 @@
     <div id="warning"></div>
   </section>
 
-  <section class="panel">
-    <div class="pad">
-      <span></span>
-      <button data-cmd="F" aria-label="Forward">▲</button>
-      <span></span>
-      <button data-cmd="L" aria-label="Turn left">◀</button>
-      <button id="stopBtn">STOP</button>
-      <button data-cmd="R" aria-label="Turn right">▶</button>
-      <span></span>
-      <button data-cmd="B" aria-label="Backward">▼</button>
-      <span></span>
+  <section class="panel drive">
+    <div class="stick" id="stick">
+      <span class="label-f">FORWARD</span>
+      <span class="label-b">BACK</span>
+      <div class="knob home" id="knob"></div>
+    </div>
+    <div class="motors">
+      <span>Left</span><div class="mbar"><span id="mbarL"></span></div><output id="outL">0%</output>
+      <span>Right</span><div class="mbar"><span id="mbarR"></span></div><output id="outR">0%</output>
     </div>
   </section>
 
+  <div class="actions">
+    <button id="stopBtn">STOP</button>
+    <button id="autoBtn">Self-drive</button>
+  </div>
+
   <section class="panel speed">
-    <div class="row"><span>Speed</span><span id="speedVal">1</span></div>
-    <input type="range" id="speed" min="0" max="9" value="1">
+    <div class="row"><span class="label">Max speed</span><span id="speedVal">4</span></div>
+    <input type="range" id="speed" min="0" max="9" value="4">
   </section>
 
-  <button id="autoBtn">Self-driving: OFF</button>
-
-  <p class="hint">Hold a button (or <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> / <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>) to drive. Let go and it stops. <kbd>Space</kbd> = stop.</p>
+  <p class="hint">Push the stick a little to go slow, all the way to go fast. Let go and the car stops.</p>
+  <p class="hint keys">Keyboard: <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> · <kbd>Space</kbd> = stop</p>
 </main>
 
 <script>
-const GUARD_CM = 15;  // must match the car program
+const GUARD_CM = 15;      // must match the car program
+const EXPO = 1.6;         // >1 = finer control near the centre of the stick
+const SEND_EVERY_MS = 50; // joystick update rate while it moves
+const KEEPALIVE_MS = 150; // repeat while held; the car stops after 400 ms of silence
 const $ = id => document.getElementById(id);
 
+// ---------- connection ----------
 // The car link is either the USB cable (Web Serial) or the BLE module (Web Bluetooth).
 // Both look the same to the rest of the page: send(text), close(), and lines arrive via onData().
-let link = null, live = false, buffer = '', held = null, repeatTimer = null, autoOn = false;
+let link = null, live = false, buffer = '', autoOn = false, wakeLock = null;
 
 const BLE_SERVICE = 0xffe0, BLE_CHAR = 0xffe1;  // standard serial service on HM-10 style modules
 
-if (!('serial' in navigator)) $('connectUsb').disabled = true;
+if (!('serial' in navigator)) $('connectUsb').hidden = true;
 if (!('bluetooth' in navigator)) $('connectBt').disabled = true;
 if (!('serial' in navigator) && !('bluetooth' in navigator)) $('unsupported').hidden = false;
 
 function setConnected(on) {
   $('dot').classList.toggle('on', on);
   $('statusText').textContent = on ? `Connected (${link.kind})` : link ? 'Waiting for car…' : 'Not connected';
-  $('connectBt').hidden = $('connectUsb').hidden = on || !!link;
+  $('connectBt').hidden = on || !!link;
+  $('connectUsb').hidden = on || !!link || !('serial' in navigator);
   $('disconnect').hidden = !on && !link;
-  if (!on) { $('cm').textContent = '–'; $('bar').style.width = 0; setAuto(false); }
+  if (on) keepScreenOn();
+  if (!on) { $('cm').textContent = '–'; $('bar').style.width = 0; $('warning').textContent = ''; setAuto(false); }
 }
 
 function send(text) {
@@ -141,7 +180,7 @@ function onData(text) {
 
 function lost() {
   link = null; live = false; buffer = '';
-  release();
+  centerStick();
   setConnected(false);
 }
 
@@ -204,18 +243,35 @@ async function connectBt() {
   device.addEventListener('gattserverdisconnected', () => { if (link && link.kind === 'Bluetooth') lost(); });
 
   // BLE allows one write at a time, and this module needs acknowledged writes.
-  // Queue them; skip repeated drive commands if the queue backs up (stop/mode always go through).
-  let chain = Promise.resolve(), pending = 0;
+  // Commands queue in order; joystick positions are coalesced so only the newest is sent.
+  // A stop throws away any joystick position still waiting.
+  const queue = [];
+  let latestJoy = null, writing = false, closing = null;
+  const pump = async () => {
+    if (writing) return;
+    const text = queue.length ? queue.shift() : latestJoy;
+    if (text === null) { if (closing) closing(); return; }
+    if (text === latestJoy) latestJoy = null;
+    writing = true;
+    try { await ch.writeValueWithResponse(encoder.encode(text)); } catch {}
+    writing = false;
+    pump();
+  };
   link = {
     kind: 'Bluetooth',
     send: text => {
-      if (pending >= 2 && 'FBLR'.includes(text)) return;
-      pending++;
-      chain = chain.then(() => ch.writeValueWithResponse(encoder.encode(text))).catch(() => {}).finally(() => pending--);
+      if (text[0] === 'J') latestJoy = text;
+      else {
+        if (text === 'S' || text === 'M' || text === 'A') latestJoy = null;
+        queue.push(text);
+      }
+      pump();
     },
     close: async () => {
+      queue.length = 0; latestJoy = null;
+      const drained = new Promise(resolve => (closing = resolve));
       link.send('S');
-      await chain;
+      await Promise.race([drained, new Promise(r => setTimeout(r, 500))]);
       device.gatt.disconnect();
     },
   };
@@ -224,9 +280,18 @@ async function connectBt() {
 
 async function disconnect() {
   const l = link;
-  if (l) await l.close();
+  if (l) { centerStick(); await l.close(); }
   lost();
 }
+
+async function keepScreenOn() {
+  try { if ('wakeLock' in navigator && !wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  if (wakeLock) wakeLock.addEventListener('release', () => (wakeLock = null), { once: true });
+}
+
+// ---------- messages from the car ----------
+
+let lastDistance = 999;
 
 function handleLine(line) {
   // Any line from the car means it's alive (Bluetooth doesn't restart it, so READY may never come).
@@ -243,72 +308,164 @@ function handleLine(line) {
 }
 
 function showDistance(cm) {
+  if (Number.isNaN(cm)) return;
   const far = cm >= 999;
   $('cm').innerHTML = far ? 'clear' : `${cm}<small>cm</small>`;
-  const pct = far ? 100 : Math.min(100, cm);
-  $('bar').style.width = pct + '%';
+  $('bar').style.width = (far ? 100 : Math.min(100, cm)) + '%';
   $('bar').style.background = cm < GUARD_CM ? 'var(--stop)' : cm < 40 ? 'var(--warn)' : 'var(--go)';
-  $('warning').textContent = cm < GUARD_CM ? 'Too close — forward is blocked' : '';
+  const blocked = cm < GUARD_CM;
+  $('warning').textContent = blocked ? 'Too close — forward is blocked, turn or reverse' : '';
+  // buzz once when something comes too close while pushing forward
+  if (blocked && lastDistance >= GUARD_CM && stickY > 0 && navigator.vibrate) navigator.vibrate(120);
+  lastDistance = cm;
+  updateMotorPreview();
 }
 
-// Driving: send the held command every 100 ms; the car stops by itself if these stop arriving.
-function press(cmd) {
-  if (autoOn || held === cmd) return;
-  held = cmd;
-  document.querySelectorAll('.pad [data-cmd]').forEach(b => b.classList.toggle('held', b.dataset.cmd === cmd));
-  send(cmd);
-  clearInterval(repeatTimer);
-  repeatTimer = setInterval(() => send(cmd), 100);
+// ---------- joystick ----------
+// stickX = turn (right +), stickY = forward (+), both -1..1 after expo.
+
+let stickX = 0, stickY = 0, rawX = 0, rawY = 0, dragging = null, lastSent = '', lastSentAt = 0;
+const keys = new Set();
+
+function shape(v) { return Math.sign(v) * Math.pow(Math.abs(v), EXPO); }
+
+function setStick(x, y) {
+  rawX = x; rawY = y;
+  stickX = shape(x); stickY = shape(y);
+  const r = $('stick').clientWidth / 2 - $('knob').clientWidth / 2;
+  $('knob').style.transform = `translate(${x * r}px, ${-y * r}px)`;
+  updateMotorPreview();
+  pushJoystick(false);
 }
 
-function release(cmd) {
-  if (cmd && held !== cmd) return;
-  held = null;
-  clearInterval(repeatTimer);
-  document.querySelectorAll('.pad .held').forEach(b => b.classList.remove('held'));
-  send('S');
+function centerStick() {
+  const wasMoving = stickX !== 0 || stickY !== 0;
+  $('knob').classList.add('home');
+  rawX = rawY = stickX = stickY = 0;
+  $('knob').style.transform = 'translate(0, 0)';
+  updateMotorPreview();
+  lastSent = '';
+  if (wasMoving) send('S');
 }
+
+function joyMessage() {
+  const x = Math.round(stickX * 100), y = Math.round(stickY * 100);
+  return `J${x},${y},${x + y}\n`;
+}
+
+function pushJoystick(keepalive) {
+  if (!live || autoOn) return;
+  if (stickX === 0 && stickY === 0) return;
+  const msg = joyMessage(), now = performance.now();
+  if (msg === lastSent && !keepalive) return;
+  if (msg !== lastSent && now - lastSentAt < SEND_EVERY_MS) return;  // the interval below catches up
+  send(msg);
+  lastSent = msg; lastSentAt = now;
+}
+
+setInterval(() => {
+  if (stickX === 0 && stickY === 0) return;
+  const now = performance.now();
+  if (joyMessage() !== lastSent || now - lastSentAt >= KEEPALIVE_MS) pushJoystick(true);
+}, SEND_EVERY_MS);
+
+// Same mixing as the car, shown as left/right power bars.
+function updateMotorPreview() {
+  let y = stickY;
+  if (y > 0 && lastDistance < GUARD_CM) y = 0;
+  let l = y + stickX, r = y - stickX;
+  const big = Math.max(Math.abs(l), Math.abs(r), 1);
+  if (big > 1) { l /= big; r /= big; }
+  for (const [v, bar, out] of [[l, 'mbarL', 'outL'], [r, 'mbarR', 'outR']]) {
+    const pct = Math.round(v * 100);
+    const el = $(bar);
+    el.style.width = Math.abs(pct) / 2 + '%';
+    el.style.left = pct >= 0 ? '50%' : 50 - Math.abs(pct) / 2 + '%';
+    el.style.background = pct >= 0 ? 'var(--go)' : 'var(--warn)';
+    $(out).textContent = (pct > 0 ? '+' : '') + pct + '%';
+  }
+}
+
+function stickFromPointer(e) {
+  const box = $('stick').getBoundingClientRect();
+  const r = box.width / 2;
+  let x = (e.clientX - box.left - r) / r;
+  let y = -(e.clientY - box.top - r) / r;
+  const len = Math.hypot(x, y);
+  if (len > 1) { x /= len; y /= len; }
+  setStick(x, y);
+}
+
+$('stick').addEventListener('pointerdown', e => {
+  if (autoOn) return;
+  dragging = e.pointerId;
+  $('stick').setPointerCapture(e.pointerId);
+  $('knob').classList.remove('home');
+  stickFromPointer(e);
+});
+$('stick').addEventListener('pointermove', e => { if (e.pointerId === dragging) stickFromPointer(e); });
+for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+  $('stick').addEventListener(type, e => {
+    if (e.pointerId !== dragging) return;
+    dragging = null;
+    centerStick();
+  });
+}
+
+// Keyboard: arrows / WASD give a full push; up+left etc. curve gently.
+const KEYMAP = { ArrowUp: 'up', w: 'up', ArrowDown: 'down', s: 'down', ArrowLeft: 'left', a: 'left', ArrowRight: 'right', d: 'right' };
+function keyName(e) { return KEYMAP[e.key.length === 1 ? e.key.toLowerCase() : e.key]; }
+function applyKeys() {
+  if (dragging !== null) return;
+  const y = keys.has('up') - keys.has('down');
+  let x = keys.has('right') - keys.has('left');
+  if (y && x) x *= 0.5;
+  if (!x && !y) { centerStick(); return; }
+  $('knob').classList.add('home');
+  const len = Math.hypot(x, y);
+  setStick(x / Math.max(1, len), y / Math.max(1, len));
+}
+addEventListener('keydown', e => {
+  if (e.key === ' ') { e.preventDefault(); stopNow(); return; }
+  const k = keyName(e);
+  if (!k || autoOn) return;
+  e.preventDefault();
+  if (!keys.has(k)) { keys.add(k); applyKeys(); }
+});
+addEventListener('keyup', e => {
+  const k = keyName(e);
+  if (k && keys.delete(k)) applyKeys();
+});
+
+// ---------- buttons ----------
 
 function stopNow() {
-  release();
-  if (autoOn) send('M');
+  keys.clear();
+  centerStick();
+  send(autoOn ? 'M' : 'S');
 }
 
 function setAuto(on) {
   autoOn = on;
   $('autoBtn').classList.toggle('on', on);
-  $('autoBtn').textContent = on ? 'Self-driving: ON (tap to stop)' : 'Self-driving: OFF';
-  document.querySelectorAll('.pad [data-cmd]').forEach(b => b.disabled = on);
+  $('autoBtn').textContent = on ? 'Self-drive ON' : 'Self-drive';
+  $('stick').classList.toggle('disabled', on);
+  if (on) { keys.clear(); centerStick(); }
 }
-
-document.querySelectorAll('.pad [data-cmd]').forEach(btn => {
-  const cmd = btn.dataset.cmd;
-  btn.addEventListener('pointerdown', e => { btn.setPointerCapture(e.pointerId); press(cmd); });
-  btn.addEventListener('pointerup', () => release(cmd));
-  btn.addEventListener('pointercancel', () => release(cmd));
-  btn.addEventListener('lostpointercapture', () => release(cmd));
-});
 
 $('stopBtn').addEventListener('pointerdown', stopNow);
 $('connectUsb').addEventListener('click', connectUsb);
 $('connectBt').addEventListener('click', connectBt);
 $('disconnect').addEventListener('click', disconnect);
-$('autoBtn').addEventListener('click', () => { release(); send(autoOn ? 'M' : 'A'); });
+$('autoBtn').addEventListener('click', () => { centerStick(); send(autoOn ? 'M' : 'A'); });
 $('speed').addEventListener('input', e => { $('speedVal').textContent = e.target.value; send(e.target.value); });
 
-const KEYS = { ArrowUp: 'F', w: 'F', ArrowDown: 'B', s: 'B', ArrowLeft: 'L', a: 'L', ArrowRight: 'R', d: 'R' };
-addEventListener('keydown', e => {
-  if (e.key === ' ') { e.preventDefault(); stopNow(); return; }
-  const cmd = KEYS[e.key.length === 1 ? e.key.toLowerCase() : e.key];
-  if (cmd) { e.preventDefault(); press(cmd); }
+// Switching apps, tabs or windows must never leave the car driving.
+addEventListener('blur', () => { if (dragging === null) { keys.clear(); centerStick(); } });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopNow();
+  else if (live) keepScreenOn();
 });
-addEventListener('keyup', e => {
-  const cmd = KEYS[e.key.length === 1 ? e.key.toLowerCase() : e.key];
-  if (cmd) release(cmd);
-});
-// Switching tabs or windows must never leave the car driving.
-addEventListener('blur', () => release());
-document.addEventListener('visibilitychange', () => { if (document.hidden) stopNow(); });
 </script>
 </body>
 </html>
