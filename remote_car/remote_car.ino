@@ -4,7 +4,7 @@
 // Commands:  J<x>,<y>,<x+y>\n   joystick, x = turn, y = forward, each -100..100
 //                               (the sum is a check: SoftwareSerial can drop bytes)
 //            S stop   0..9 max speed   A auto (obstacle avoid)   M manual
-//            G print the trip log (USB only)
+//            G print the trip log (USB only)   V look test: left, right, ahead (manual only)
 // Reports:   "D <cm>" distance (999 = nothing in range), "MODE auto|manual", "READY"
 //
 // Safety: in manual mode the car stops if no command arrives for 400 ms
@@ -235,6 +235,15 @@ long readSteadyCm() {
   return r[0] + r[1] + r[2] - lo - hi;
 }
 
+// Stand still and look both ways, for checking the servo and which way is left.
+void lookTest() {
+  stopNow();
+  lookAt(LOOK_LEFT);   delay(LOOK_SETTLE_MS * 2); long l = readSteadyCm();
+  lookAt(LOOK_RIGHT);  delay(LOOK_SETTLE_MS * 2); long r = readSteadyCm();
+  lookAt(LOOK_CENTER); delay(LOOK_SETTLE_MS);     long c = readSteadyCm();
+  say("LOOK left " + String(l) + " right " + String(r) + " ahead " + String(c));
+}
+
 // ---- commands ----
 
 // send a line to both USB and Bluetooth
@@ -285,6 +294,9 @@ void handleCommand(char c, bool fromUsb) {
       return;
     case 'G':
       if (fromUsb) printLog();  // too long for the Bluetooth link
+      return;
+    case 'V':
+      if (!autoMode) lookTest();
       return;
   }
 }
