@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Car Remote</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #1a2027; --line: #2a323c; --text: #e8edf2; --muted: #8a96a3;
+    --accent: #3fa7ff; --go: #2ecc71; --warn: #f5b041; --stop: #ef4b4b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; justify-content: center; padding: 24px 16px;
+    user-select: none; -webkit-user-select: none;
+  }
+  main { width: 100%; max-width: 440px; display: grid; gap: 16px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--stop); }
+  .dot.on { background: var(--go); box-shadow: 0 0 8px var(--go); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+  button {
+    font: inherit; color: var(--text); background: #232b34; border: 1px solid var(--line);
+    border-radius: 12px; cursor: pointer; touch-action: none;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .connect { display: flex; flex-wrap: wrap; gap: 10px; }
+  .connect button { flex: 1 1 160px; padding: 12px 14px; }
+  #connectBt { background: var(--accent); border-color: var(--accent); color: #06121e; font-weight: 600; }
+
+  .distance { display: grid; gap: 8px; }
+  .distance .row { display: flex; justify-content: space-between; align-items: baseline; }
+  .distance .label { color: var(--muted); font-size: 13px; }
+  #cm { font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  #cm small { font-size: 15px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .bar { height: 10px; background: #0c1014; border-radius: 6px; overflow: hidden; }
+  #bar { height: 100%; width: 0; background: var(--go); transition: width .1s, background .2s; }
+  #warning { color: var(--stop); font-size: 13px; min-height: 18px; }
+
+  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .pad button { aspect-ratio: 1; font-size: 30px; }
+  .pad button.held { background: var(--accent); border-color: var(--accent); color: #06121e; }
+  .pad #stopBtn { background: var(--stop); border-color: var(--stop); font-size: 16px; font-weight: 700; }
+
+  .speed { display: grid; gap: 8px; }
+  .speed .row { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; }
+  #speedVal { color: var(--text); font-weight: 600; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+
+  #autoBtn { width: 100%; padding: 14px; font-weight: 600; }
+  #autoBtn.on { background: var(--warn); border-color: var(--warn); color: #1d1400; }
+
+  .hint { color: var(--muted); font-size: 12px; text-align: center; }
+  kbd { background: #232b34; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font: 11px ui-monospace, monospace; }
+  #unsupported { color: var(--warn); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>🚗 Car Remote</h1>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">Not connected</span></div>
+  </header>
+
+  <p id="unsupported" hidden>This browser can't talk to the car. Open this page in Google Chrome.</p>
+
+  <div class="connect">
+    <button id="connectBt">Connect by Bluetooth</button>
+    <button id="connectUsb">Connect by USB cable</button>
+    <button id="disconnect" hidden>Disconnect</button>
+  </div>
+
+  <section class="panel distance">
+    <div class="row"><span class="label">Distance ahead</span><span id="cm">–</span></div>
+    <div class="bar"><div id="bar"></div></div>
+    <div id="warning"></div>
+  </section>
+
+  <section class="panel">
+    <div class="pad">
+      <span></span>
+      <button data-cmd="F" aria-label="Forward">▲</button>
+      <span></span>
+      <button data-cmd="L" aria-label="Turn left">◀</button>
+      <button id="stopBtn">STOP</button>
+      <button data-cmd="R" aria-label="Turn right">▶</button>
+      <span></span>
+      <button data-cmd="B" aria-label="Backward">▼</button>
+      <span></span>
+    </div>
+  </section>
+
+  <section class="panel speed">
+    <div class="row"><span>Speed</span><span id="speedVal">1</span></div>
+    <input type="range" id="speed" min="0" max="9" value="1">
+  </section>
+
+  <button id="autoBtn">Self-driving: OFF</button>
+
+  <p class="hint">Hold a button (or <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> / <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>) to drive. Let go and it stops. <kbd>Space</kbd> = stop.</p>
+</main>
+
+<script>
+const GUARD_CM = 15;  // must match the car program
+const $ = id => document.getElementById(id);
+
+// The car link is either the USB cable (Web Serial) or the BLE module (Web Bluetooth).
+// Both look the same to the rest of the page: send(text), close(), and lines arrive via onData().
+let link = null, live = false, buffer = '', held = null, repeatTimer = null, autoOn = false;
+
+const BLE_SERVICE = 0xffe0, BLE_CHAR = 0xffe1;  // standard serial service on HM-10 style modules
+
+if (!('serial' in navigator)) $('connectUsb').disabled = true;
+if (!('bluetooth' in navigator)) $('connectBt').disabled = true;
+if (!('serial' in navigator) && !('bluetooth' in navigator)) $('unsupported').hidden = false;
+
+function setConnected(on) {
+  $('dot').classList.toggle('on', on);
+  $('statusText').textContent = on ? `Connected (${link.kind})` : link ? 'Waiting for car…' : 'Not connected';
+  $('connectBt').hidden = $('connectUsb').hidden = on || !!link;
+  $('disconnect').hidden = !on && !link;
+  if (!on) { $('cm').textContent = '–'; $('bar').style.width = 0; setAuto(false); }
+}
+
+function send(text) {
+  if (link) link.send(text);
+}
+
+function onData(text) {
+  buffer += text;
+  let i;
+  while ((i = buffer.indexOf('\n')) >= 0) {
+    handleLine(buffer.slice(0, i).trim());
+    buffer = buffer.slice(i + 1);
+  }
+}
+
+function lost() {
+  link = null; live = false; buffer = '';
+  release();
+  setConnected(false);
+}
+
+async function connectUsb() {
+  let port;
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600 });
+  } catch {
+    $('statusText').textContent = 'Could not connect';
+    return;
+  }
+  const writer = port.writable.getWriter();
+  const encoder = new TextEncoder();
+  link = {
+    kind: 'USB',
+    send: text => writer.write(encoder.encode(text)).catch(() => {}),
+    close: async () => {
+      try { await writer.write(encoder.encode('S')); } catch {}
+      try { writer.releaseLock(); } catch {}
+      try { await port.close(); } catch {}
+    },
+  };
+  setConnected(false);
+
+  const decoder = new TextDecoderStream();
+  port.readable.pipeTo(decoder.writable).catch(() => {});
+  const reader = decoder.readable.getReader();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      onData(value);
+    }
+  } catch {
+    // cable pulled or port closed
+  }
+  if (link && link.kind === 'USB') lost();
+}
+
+async function connectBt() {
+  let device, ch;
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'HC' }, { namePrefix: 'BT' }, { namePrefix: 'JDY' }, { namePrefix: 'MLT' }, { services: [BLE_SERVICE] }],
+      optionalServices: [BLE_SERVICE],
+    });
+    $('statusText').textContent = 'Connecting…';
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(BLE_SERVICE);
+    ch = await service.getCharacteristic(BLE_CHAR);
+    await ch.startNotifications();
+  } catch {
+    $('statusText').textContent = 'Could not connect';
+    try { device.gatt.disconnect(); } catch {}
+    return;
+  }
+  const decoder = new TextDecoder(), encoder = new TextEncoder();
+  ch.addEventListener('characteristicvaluechanged', e => onData(decoder.decode(e.target.value, { stream: true })));
+  device.addEventListener('gattserverdisconnected', () => { if (link && link.kind === 'Bluetooth') lost(); });
+
+  // BLE allows one write at a time, and this module needs acknowledged writes.
+  // Queue them; skip repeated drive commands if the queue backs up (stop/mode always go through).
+  let chain = Promise.resolve(), pending = 0;
+  link = {
+    kind: 'Bluetooth',
+    send: text => {
+      if (pending >= 2 && 'FBLR'.includes(text)) return;
+      pending++;
+      chain = chain.then(() => ch.writeValueWithResponse(encoder.encode(text))).catch(() => {}).finally(() => pending--);
+    },
+    close: async () => {
+      link.send('S');
+      await chain;
+      device.gatt.disconnect();
+    },
+  };
+  setConnected(false);
+}
+
+async function disconnect() {
+  const l = link;
+  if (l) await l.close();
+  lost();
+}
+
+function handleLine(line) {
+  // Any line from the car means it's alive (Bluetooth doesn't restart it, so READY may never come).
+  if (!live) {
+    live = true;
+    setConnected(true);
+    send(String($('speed').value));
+  }
+  if (line.startsWith('D ')) {
+    showDistance(parseInt(line.slice(2), 10));
+  } else if (line.startsWith('MODE ')) {
+    setAuto(line === 'MODE auto');
+  }
+}
+
+function showDistance(cm) {
+  const far = cm >= 999;
+  $('cm').innerHTML = far ? 'clear' : `${cm}<small>cm</small>`;
+  const pct = far ? 100 : Math.min(100, cm);
+  $('bar').style.width = pct + '%';
+  $('bar').style.background = cm < GUARD_CM ? 'var(--stop)' : cm < 40 ? 'var(--warn)' : 'var(--go)';
+  $('warning').textContent = cm < GUARD_CM ? 'Too close — forward is blocked' : '';
+}
+
+// Driving: send the held command every 100 ms; the car stops by itself if these stop arriving.
+function press(cmd) {
+  if (autoOn || held === cmd) return;
+  held = cmd;
+  document.querySelectorAll('.pad [data-cmd]').forEach(b => b.classList.toggle('held', b.dataset.cmd === cmd));
+  send(cmd);
+  clearInterval(repeatTimer);
+  repeatTimer = setInterval(() => send(cmd), 100);
+}
+
+function release(cmd) {
+  if (cmd && held !== cmd) return;
+  held = null;
+  clearInterval(repeatTimer);
+  document.querySelectorAll('.pad .held').forEach(b => b.classList.remove('held'));
+  send('S');
+}
+
+function stopNow() {
+  release();
+  if (autoOn) send('M');
+}
+
+function setAuto(on) {
+  autoOn = on;
+  $('autoBtn').classList.toggle('on', on);
+  $('autoBtn').textContent = on ? 'Self-driving: ON (tap to stop)' : 'Self-driving: OFF';
+  document.querySelectorAll('.pad [data-cmd]').forEach(b => b.disabled = on);
+}
+
+document.querySelectorAll('.pad [data-cmd]').forEach(btn => {
+  const cmd = btn.dataset.cmd;
+  btn.addEventListener('pointerdown', e => { btn.setPointerCapture(e.pointerId); press(cmd); });
+  btn.addEventListener('pointerup', () => release(cmd));
+  btn.addEventListener('pointercancel', () => release(cmd));
+  btn.addEventListener('lostpointercapture', () => release(cmd));
+});
+
+$('stopBtn').addEventListener('pointerdown', stopNow);
+$('connectUsb').addEventListener('click', connectUsb);
+$('connectBt').addEventListener('click', connectBt);
+$('disconnect').addEventListener('click', disconnect);
+$('autoBtn').addEventListener('click', () => { release(); send(autoOn ? 'M' : 'A'); });
+$('speed').addEventListener('input', e => { $('speedVal').textContent = e.target.value; send(e.target.value); });
+
+const KEYS = { ArrowUp: 'F', w: 'F', ArrowDown: 'B', s: 'B', ArrowLeft: 'L', a: 'L', ArrowRight: 'R', d: 'R' };
+addEventListener('keydown', e => {
+  if (e.key === ' ') { e.preventDefault(); stopNow(); return; }
+  const cmd = KEYS[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+  if (cmd) { e.preventDefault(); press(cmd); }
+});
+addEventListener('keyup', e => {
+  const cmd = KEYS[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+  if (cmd) release(cmd);
+});
+// Switching tabs or windows must never leave the car driving.
+addEventListener('blur', () => release());
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopNow(); });
+</script>
+</body>
+</html>
