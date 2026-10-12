@@ -11,10 +11,10 @@
 // (the remote repeats the joystick position while it is held), and it won't
 // move forward when something is closer than GUARD_CM (turning away still works).
 //
-// Auto mode: drive forward while the sensor (servo on pin 10) keeps sweeping
-// ahead / a little left / ahead / a little right, so the car's corners are covered
-// too, not just the narrow beam straight ahead. Something on one side: nudge away
-// without stopping. Something ahead (or very close at a side, or an echo that
+// Auto mode: drive forward while the sensor (servo on pin 10) sweeps like a radar
+// from 30 to 150 degrees, so the car's corners and sides are covered, not just the
+// narrow beam straight ahead. Each reading becomes "this far ahead, this far to the
+// side": in the car's lane = stop; next to the lane = nudge away without stopping. Something ahead (or very close at a side, or an echo that
 // vanished while closing in on something - angled walls bounce the sound away):
 // brake, look left and right, turn toward the clearer side, then check ahead
 // before driving on. If the distance stops changing while driving, it's stuck:
@@ -38,13 +38,16 @@ const int AVOID_CM = 40;     // auto: stop and look when something ahead is clos
 const int BACKUP_CM = 15;    // auto: back up first when closer than this
 const int CLEAR_CM = 50;     // auto: after a turn, ahead must be at least this clear
 const int SLOW_CM = 60;      // auto: creep when something ahead is closer than this
-const int SIDE_NUDGE_CM = 25;  // auto: something this close at a side is in the car's path
-const int SIDE_STOP_CM = 12;   // auto: ...and this close is about to hit a corner
+const int LANE_HALF_CM = 12;  // auto: half the car's width plus a margin - closer to the middle is in its path
+const int NUDGE_LANE_CM = 22;  // auto: something this close to the middle...
+const int NUDGE_AHEAD_CM = 35; // ...and this close ahead gets steered away from
 const int SUSPECT_CM = 60;   // auto: an echo vanishing while this close is suspicious
 const unsigned long COMMAND_TIMEOUT_MS = 400;
 
 const int MIN_DRIVE_PWM = 60;   // below this the motors just hum
 const int MIN_SPIN_PWM = 110;   // turning in place drags the tyres, needs more push
+const int TURN_PWM_START = 130; // auto turns start here and get stronger if the car doesn't rotate
+const int TURN_PWM_STEP = 30, TURN_PWM_MAX = 230;
 const int AUTO_MAX_PWM = 75;    // self-driving crawls whatever the slider says
 const int AUTO_SLOW_PWM = 65;   // ...and creeps near obstacles
 const int ACCEL_PER_MS = 1;     // 0 -> 255 in about a quarter second
@@ -63,10 +66,11 @@ const unsigned long STUCK_MS = 3000;        // distance ahead unchanged this lon
 const int STUCK_CHANGE_CM = 4;
 const byte VERIFY_TRIES = 3;                // turns to find a clear way before giving up
 
-// sensor angles while driving: ahead, a bit left, ahead, a bit right
-const int SWEEP[] = { 90, 115, 90, 65 };
+// radar sweep while driving: across to the left, back across to the right, and so on
+const int SWEEP[] = { 90, 110, 130, 150, 130, 110, 90, 70, 50, 30, 50, 70 };
 const byte SWEEP_LEN = sizeof(SWEEP) / sizeof(SWEEP[0]);
-const unsigned long SWEEP_PING_MS = 100;    // servo moves 25 degrees in ~45 ms, then settles
+const unsigned long SWEEP_PING_MS = 70;     // servo moves 20 degrees in ~35 ms, then settles
+const unsigned long PING_GAP_MS = 60;       // let one ping's echoes die away before the next
 
 SoftwareSerial bt(BT_RX, BT_TX);
 Servo look;
@@ -96,11 +100,15 @@ unsigned long stepUntil = 0;
 long frontCm = 999, leftCm = 999, rightCm = 999;  // from the stop-and-look
 bool turnLeft = false, bothBlocked = false;
 byte verifyTry = 0;
+int turnPwm = TURN_PWM_START;
+long lastVerifyCm = -1, prevLeftCm = -1, prevRightCm = -1;
 unsigned long autoStartedAt = 0, lastSampleAt = 0;
 
 // what the sweep saw while driving
 byte sweepIdx = 0;
-long aheadCm = 999, sideLeftCm = 999, sideRightCm = 999;
+long aheadCm = 999;                          // nearest thing ahead in the front cone
+long nearLeftCm = 999, nearRightCm = 999;    // nearest on each side since the last log line
+unsigned long slowUntil = 0;
 byte lostEchoes = 0;         // no-echo readings ahead in a row
 long stuckRefCm = 999;
 unsigned long stuckSince = 0;
@@ -110,8 +118,8 @@ unsigned long stuckSince = 0;
 // slot: run, event, tenths of a second since auto started (2 bytes), a, b, c, d
 
 enum LogEvent : byte { EV_START = 1, EV_CRUISE, EV_BLOCKED, EV_LOOKED, EV_BACKUP, EV_TURN, EV_END,
-                       EV_NUDGE, EV_VERIFY, EV_STUCK };
-const byte EV_LAST = EV_STUCK;
+                       EV_NUDGE, EV_VERIFY, EV_STUCK, EV_BOOST };
+const byte EV_LAST = EV_BOOST;
 enum BlockReason : byte { BY_AHEAD, BY_LEFT, BY_RIGHT, BY_LOST_ECHO };
 const byte LOG_MAGIC = 0xA8;  // changed for auto v3: wipes the old-format log once
 const int LOG_START = 8, LOG_SLOT = 8;
@@ -176,14 +184,15 @@ void printLog() {
                        Serial.print(F("  right ")); printCm(b); break;
       case EV_BACKUP:  Serial.print(F("BACKUP")); break;
       case EV_TURN:    Serial.print(F("TURN ")); Serial.print(a ? F("left ") : F("right "));
-                       Serial.print(b * 10); Serial.print(F("ms")); break;
+                       Serial.print(b * 10); Serial.print(F("ms  power ")); Serial.print(c); break;
       case EV_END:     Serial.print(F("END auto")); break;
       case EV_NUDGE:   Serial.print(F("nudge away from ")); Serial.print(b ? F("left ") : F("right "));
-                       printCm(a); break;
+                       printCm(a); Serial.print(F(" at ")); Serial.print(c); Serial.print(F(" deg")); break;
       case EV_VERIFY:  Serial.print(F("check ahead ")); printCm(a);
                        Serial.print(a >= CLEAR_CM ? F("  clear") : F("  still blocked"));
                        Serial.print(F(" (try ")); Serial.print(b); Serial.print(')'); break;
       case EV_STUCK:   Serial.print(F("STUCK ahead ")); printCm(a); break;
+      case EV_BOOST:   Serial.print(F("didn't rotate -> turn power ")); Serial.print(a); break;
     }
     Serial.println();
   }
@@ -271,6 +280,9 @@ void applyJoystick() {
 
 // 0 means no usable reading (closer than the sensor's 2 cm minimum is noise)
 long readDistanceCm() {
+  static unsigned long lastTrigAt = 0;
+  while (millis() - lastTrigAt < PING_GAP_MS) {}  // an early ping hears the last one's echoes
+  lastTrigAt = millis();
   digitalWrite(TRIG, LOW);  delayMicroseconds(2);
   digitalWrite(TRIG, HIGH); delayMicroseconds(10);
   digitalWrite(TRIG, LOW);
@@ -286,7 +298,6 @@ long readSteadyCm() {
   for (int i = 0; i < 3; i++) {
     r[i] = readDistanceCm();
     if (r[i] == 0) r[i] = 999;
-    delay(30);
   }
   long lo = min(r[0], min(r[1], r[2])), hi = max(r[0], max(r[1], r[2]));
   return r[0] + r[1] + r[2] - lo - hi;
@@ -319,6 +330,8 @@ void setMode(bool on) {
     logEvent(EV_END);
   }
   autoMode = on;
+  turnPwm = TURN_PWM_START;
+  lastVerifyCm = prevLeftCm = prevRightCm = -1;
   stopNow();
   lookAt(LOOK_CENTER);
   startCruise(millis());
@@ -383,7 +396,8 @@ void feed(LineIn &in, char c) {
 void startCruise(unsigned long now) {
   step = CRUISE;
   sweepIdx = 0;
-  aheadCm = sideLeftCm = sideRightCm = 999;
+  aheadCm = nearLeftCm = nearRightCm = 999;
+  lastVerifyCm = -1;
   lostEchoes = 0;
   stuckRefCm = 999;
   stuckSince = lastSampleAt = now;
@@ -402,10 +416,20 @@ void blocked(long cm, byte why, unsigned long now) {
 
 void startTurn(unsigned long now) {
   unsigned long ms = bothBlocked ? UTURN_MS : TURN_MS;
-  setTargets(turnLeft ? -100 : 100, 0, AUTO_MAX_PWM);
-  logEvent(EV_TURN, turnLeft, ms / 10);
+  setTargets(turnLeft ? -100 : 100, 0, turnPwm);
+  logEvent(EV_TURN, turnLeft, ms / 10, turnPwm);
   step = TURN;
   stepUntil = now + ms;
+}
+
+bool same(long a, long b) { return a >= 0 && b >= 0 && a < 999 && b < 999 && abs(a - b) <= 3; }
+
+// A turn that leaves the sensor seeing the same thing didn't rotate the car:
+// the tyres are dragging on this floor, so push harder next time.
+void checkRotated(bool rotated) {
+  if (rotated || turnPwm >= TURN_PWM_MAX) return;
+  turnPwm = min(turnPwm + TURN_PWM_STEP, TURN_PWM_MAX);
+  logEvent(EV_BOOST, turnPwm);
 }
 
 void startBackup(unsigned long now) {
@@ -415,49 +439,63 @@ void startBackup(unsigned long now) {
   stepUntil = now + BACKUP_MS;
 }
 
-// One reading from the sweep while driving. angle > 90 is the left side.
+// One radar reading while driving. angle > 90 is the left side.
 void cruiseSaw(int angle, long cm, unsigned long now) {
-  if (angle == LOOK_CENTER) {
-    if (cm >= 999) {
-      // No echo. Indoors that usually means a slanted or soft surface, not
-      // open space - if something was close a moment ago, don't trust it.
-      if (aheadCm < SUSPECT_CM && ++lostEchoes >= 2) { blocked(aheadCm, BY_LOST_ECHO, now); return; }
-      stuckRefCm = 999; stuckSince = now;  // no echo tells us nothing about being stuck
-      return;
-    }
-    lostEchoes = 0;
-    aheadCm = cm;
-    if (cm < AVOID_CM) { blocked(cm, BY_AHEAD, now); return; }
-    if (abs(cm - stuckRefCm) > STUCK_CHANGE_CM) { stuckRefCm = cm; stuckSince = now; }
-    else if (now - stuckSince > STUCK_MS) {
-      logEvent(EV_STUCK, cmByte(cm));
-      brakeNow();
-      bothBlocked = true;  // back up, then turn about
-      turnLeft = sideLeftCm > sideRightCm;
-      startBackup(now);
-    }
+  int off = abs(angle - LOOK_CENTER);
+  bool onLeft = angle > LOOK_CENTER;
+  bool front = off <= 20;
+
+  if (cm >= 999) {
+    // No echo. Indoors that usually means a slanted or soft surface, not
+    // open space - if something was close a moment ago, don't trust it.
+    if (front && aheadCm < SUSPECT_CM && ++lostEchoes >= 2) blocked(aheadCm, BY_LOST_ECHO, now);
+    if (angle == LOOK_CENTER) { stuckRefCm = 999; stuckSince = now; }  // tells us nothing about being stuck
     return;
   }
 
-  bool onLeft = angle > LOOK_CENTER;
-  (onLeft ? sideLeftCm : sideRightCm) = cm;
-  if (cm < SIDE_STOP_CM) { blocked(cm, onLeft ? BY_LEFT : BY_RIGHT, now); return; }
-  if (cm < SIDE_NUDGE_CM) {
-    logEvent(EV_NUDGE, cmByte(cm), onLeft);
-    setTargets(onLeft ? 100 : -100, 0, AUTO_MAX_PWM);  // spin away from it, briefly
+  // where the thing is relative to the car: how far ahead, how far from the middle
+  float rad = off * (PI / 180.0);
+  long ahead = cm * cos(rad), lane = cm * sin(rad);
+
+  if (front) { lostEchoes = 0; aheadCm = ahead; }
+  if (off) {
+    long &nearest = onLeft ? nearLeftCm : nearRightCm;
+    nearest = min(nearest, cm);
+  }
+
+  if (lane < LANE_HALF_CM && ahead < AVOID_CM) {
+    blocked(cm, front ? BY_AHEAD : onLeft ? BY_LEFT : BY_RIGHT, now);
+    return;
+  }
+  if (lane < NUDGE_LANE_CM && ahead < SLOW_CM) slowUntil = now + 600;
+  if (off && lane < NUDGE_LANE_CM && ahead < NUDGE_AHEAD_CM) {
+    logEvent(EV_NUDGE, cmByte(cm), onLeft, off);
+    setTargets(onLeft ? 100 : -100, 0, turnPwm);  // spin away from it, briefly
     step = NUDGE;
     stepUntil = now + NUDGE_MS;
+    return;
+  }
+
+  if (angle != LOOK_CENTER) return;
+  if (abs(cm - stuckRefCm) > STUCK_CHANGE_CM) { stuckRefCm = cm; stuckSince = now; }
+  else if (now - stuckSince > STUCK_MS) {
+    logEvent(EV_STUCK, cmByte(cm));
+    brakeNow();
+    bothBlocked = true;  // back up, then turn about
+    turnLeft = nearLeftCm > nearRightCm;
+    startBackup(now);
   }
 }
 
 void runAuto(unsigned long now) {
   switch (step) {
     case CRUISE: {
-      int top = min(maxSpeed, aheadCm < SLOW_CM || lostEchoes ? AUTO_SLOW_PWM : AUTO_MAX_PWM);
+      int top = min(maxSpeed, now < slowUntil || lostEchoes ? AUTO_SLOW_PWM : AUTO_MAX_PWM);
       setTargets(0, 100, top);
       if (now - lastSampleAt >= 1000) {
         lastSampleAt = now;
-        logEvent(EV_CRUISE, cmByte(aheadCm), cmByte(sideLeftCm), cmByte(sideRightCm), abs(curL));
+        logEvent(EV_CRUISE, cmByte(aheadCm), cmByte(nearLeftCm), cmByte(nearRightCm), abs(curL));
+        nearLeftCm = nearRightCm = 999;
       }
       break;
     }
@@ -477,6 +515,9 @@ void runAuto(unsigned long now) {
         rightCm = readSteadyCm();
         lookAt(LOOK_CENTER);
         logEvent(EV_LOOKED, cmByte(leftCm), cmByte(rightCm));
+        // the same view as the last look: the turn in between didn't rotate the car
+        checkRotated(!(same(leftCm, prevLeftCm) && same(rightCm, prevRightCm)));
+        prevLeftCm = leftCm; prevRightCm = rightCm;
         turnLeft = leftCm > rightCm;
         bothBlocked = max(leftCm, rightCm) < AVOID_CM;
         now = millis();
@@ -502,9 +543,14 @@ void runAuto(unsigned long now) {
         long cm = readSteadyCm();
         verifyTry++;
         logEvent(EV_VERIFY, cmByte(cm), verifyTry);
+        if (verifyTry > 1) checkRotated(!same(cm, lastVerifyCm));
+        lastVerifyCm = cm;
         now = millis();
         if (cm >= CLEAR_CM) {
           startCruise(now);
+        } else if (cm < BACKUP_CM) {
+          bothBlocked = false;  // nose against something: back off before turning again
+          startBackup(now);
         } else if (verifyTry < VERIFY_TRIES) {
           bothBlocked = false;  // a bit more the same way
           startTurn(now);
