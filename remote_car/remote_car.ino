@@ -11,10 +11,15 @@
 // (the remote repeats the joystick position while it is held), and it won't
 // move forward when something is closer than GUARD_CM (turning away still works).
 //
-// Auto mode: crawl forward; when the sensor sees something close twice in a row,
-// stop, turn the sensor (servo on pin 10) left and right, then turn toward the
-// clearer side. Everything it does is written to EEPROM (the trip log) so a run
-// can be read back over USB afterwards with G.
+// Auto mode: drive forward while the sensor (servo on pin 10) keeps sweeping
+// ahead / a little left / ahead / a little right, so the car's corners are covered
+// too, not just the narrow beam straight ahead. Something on one side: nudge away
+// without stopping. Something ahead (or very close at a side, or an echo that
+// vanished while closing in on something - angled walls bounce the sound away):
+// brake, look left and right, turn toward the clearer side, then check ahead
+// before driving on. If the distance stops changing while driving, it's stuck:
+// back up and turn round. Everything it does is written to EEPROM (the trip log)
+// so a run can be read back over USB afterwards with G.
 
 #include <SoftwareSerial.h>
 #include <Servo.h>
@@ -29,13 +34,19 @@ const int BT_RX = 8, BT_TX = 9;  // to Bluetooth TXD, RXD
 const int SERVO_PIN = 10;        // turns the ultrasonic sensor
 
 const int GUARD_CM = 15;     // manual: block forward when closer than this
-const int AVOID_CM = 30;     // auto: start avoiding when closer than this
+const int AVOID_CM = 40;     // auto: stop and look when something ahead is closer than this
 const int BACKUP_CM = 15;    // auto: back up first when closer than this
+const int CLEAR_CM = 50;     // auto: after a turn, ahead must be at least this clear
+const int SLOW_CM = 60;      // auto: creep when something ahead is closer than this
+const int SIDE_NUDGE_CM = 25;  // auto: something this close at a side is in the car's path
+const int SIDE_STOP_CM = 12;   // auto: ...and this close is about to hit a corner
+const int SUSPECT_CM = 60;   // auto: an echo vanishing while this close is suspicious
 const unsigned long COMMAND_TIMEOUT_MS = 400;
 
 const int MIN_DRIVE_PWM = 60;   // below this the motors just hum
 const int MIN_SPIN_PWM = 110;   // turning in place drags the tyres, needs more push
 const int AUTO_MAX_PWM = 75;    // self-driving crawls whatever the slider says
+const int AUTO_SLOW_PWM = 65;   // ...and creeps near obstacles
 const int ACCEL_PER_MS = 1;     // 0 -> 255 in about a quarter second
 const int DECEL_PER_MS = 3;     // slowing down is quicker than speeding up
 
@@ -46,6 +57,16 @@ const unsigned long LOOK_SETTLE_MS = 450;   // servo travel time for a 60 degree
 const unsigned long BACKUP_MS = 500;
 const unsigned long TURN_MS = 450;          // roughly a quarter turn
 const unsigned long UTURN_MS = 900;         // both sides blocked: turn about
+const unsigned long NUDGE_MS = 200;         // small steer away from a side obstacle
+const unsigned long BRAKE_MS = 120;         // short the motors to stop instead of rolling on
+const unsigned long STUCK_MS = 3000;        // distance ahead unchanged this long = stuck
+const int STUCK_CHANGE_CM = 4;
+const byte VERIFY_TRIES = 3;                // turns to find a clear way before giving up
+
+// sensor angles while driving: ahead, a bit left, ahead, a bit right
+const int SWEEP[] = { 90, 115, 90, 65 };
+const byte SWEEP_LEN = sizeof(SWEEP) / sizeof(SWEEP[0]);
+const unsigned long SWEEP_PING_MS = 100;    // servo moves 25 degrees in ~45 ms, then settles
 
 SoftwareSerial bt(BT_RX, BT_TX);
 Servo look;
@@ -57,6 +78,8 @@ unsigned long lastCommandAt = 0;
 long distance = 999;
 unsigned long lastPingAt = 0, lastReportAt = 0, lastRampAt = 0;
 unsigned long servoReleaseAt = 0;  // detach after moving so it doesn't jitter
+int servoAngle = 90;
+unsigned long brakeUntil = 0;
 
 int joyX = 0, joyY = 0;      // last joystick position, -100..100
 int targetL = 0, targetR = 0;  // signed PWM the motors are heading to
@@ -67,20 +90,30 @@ struct LineIn { bool active = false; char buf[16]; byte len = 0; };
 LineIn usbLine, btLine;
 
 // auto mode steps
-enum AutoStep { CRUISE, LOOKING_LEFT, LOOKING_RIGHT, BACKUP, TURN };
+enum AutoStep { CRUISE, NUDGE, LOOKING_LEFT, LOOKING_RIGHT, BACKUP, TURN, VERIFY };
 AutoStep step = CRUISE;
 unsigned long stepUntil = 0;
-byte closeCount = 0;         // close readings in a row while cruising
-long frontCm = 999, leftCm = 999, rightCm = 999;
+long frontCm = 999, leftCm = 999, rightCm = 999;  // from the stop-and-look
 bool turnLeft = false, bothBlocked = false;
+byte verifyTry = 0;
 unsigned long autoStartedAt = 0, lastSampleAt = 0;
+
+// what the sweep saw while driving
+byte sweepIdx = 0;
+long aheadCm = 999, sideLeftCm = 999, sideRightCm = 999;
+byte lostEchoes = 0;         // no-echo readings ahead in a row
+long stuckRefCm = 999;
+unsigned long stuckSince = 0;
 
 // ---- trip log (EEPROM ring buffer) ----
 // byte 0 magic, 1 next slot, 2 run number; slots of 8 bytes from LOG_START.
-// slot: run, event, tenths of a second since auto started (2 bytes), a, b, c, unused
+// slot: run, event, tenths of a second since auto started (2 bytes), a, b, c, d
 
-enum LogEvent : byte { EV_START = 1, EV_CRUISE, EV_BLOCKED, EV_LOOKED, EV_BACKUP, EV_TURN, EV_END };
-const byte LOG_MAGIC = 0xA7;
+enum LogEvent : byte { EV_START = 1, EV_CRUISE, EV_BLOCKED, EV_LOOKED, EV_BACKUP, EV_TURN, EV_END,
+                       EV_NUDGE, EV_VERIFY, EV_STUCK };
+const byte EV_LAST = EV_STUCK;
+enum BlockReason : byte { BY_AHEAD, BY_LEFT, BY_RIGHT, BY_LOST_ECHO };
+const byte LOG_MAGIC = 0xA8;  // changed for auto v3: wipes the old-format log once
 const int LOG_START = 8, LOG_SLOT = 8;
 const byte LOG_SLOTS = (1024 - LOG_START) / LOG_SLOT;
 byte runNumber = 0;
@@ -95,7 +128,7 @@ void logInit() {
   runNumber = EEPROM.read(2);
 }
 
-void logEvent(byte ev, byte a = 0, byte b = 0, byte c = 0) {
+void logEvent(byte ev, byte a = 0, byte b = 0, byte c = 0, byte d = 0) {
   byte slot = EEPROM.read(1) % LOG_SLOTS;
   unsigned int tenths = (millis() - autoStartedAt) / 100;
   int at = LOG_START + slot * LOG_SLOT;
@@ -106,6 +139,7 @@ void logEvent(byte ev, byte a = 0, byte b = 0, byte c = 0) {
   EEPROM.update(at + 4, a);
   EEPROM.update(at + 5, b);
   EEPROM.update(at + 6, c);
+  EEPROM.update(at + 7, d);
   EEPROM.update(1, (slot + 1) % LOG_SLOTS);
 }
 
@@ -120,24 +154,36 @@ void printLog() {
   for (byte i = 0; i < LOG_SLOTS; i++) {
     int at = LOG_START + ((next + i) % LOG_SLOTS) * LOG_SLOT;
     byte ev = EEPROM.read(at + 1);
-    if (ev < EV_START || ev > EV_END) continue;  // empty slot
+    if (ev < EV_START || ev > EV_LAST) continue;  // empty slot
     unsigned int tenths = EEPROM.read(at + 2) | (EEPROM.read(at + 3) << 8);
-    byte a = EEPROM.read(at + 4), b = EEPROM.read(at + 5), c = EEPROM.read(at + 6);
+    byte a = EEPROM.read(at + 4), b = EEPROM.read(at + 5), c = EEPROM.read(at + 6), d = EEPROM.read(at + 7);
     Serial.print(F("run ")); Serial.print(EEPROM.read(at));
     Serial.print(F("  ")); Serial.print(tenths / 10); Serial.print('.'); Serial.print(tenths % 10);
     Serial.print(F("s  "));
     switch (ev) {
       case EV_START:   Serial.print(F("START auto")); break;
-      case EV_CRUISE:  Serial.print(F("cruise  front ")); printCm(a);
-                       Serial.print(F("  motors L ")); Serial.print(b);
-                       Serial.print(F(" R ")); Serial.print(c); break;
-      case EV_BLOCKED: Serial.print(F("BLOCKED front ")); printCm(a); break;
+      case EV_CRUISE:  Serial.print(F("cruise  ahead ")); printCm(a);
+                       Serial.print(F("  left ")); printCm(b);
+                       Serial.print(F("  right ")); printCm(c);
+                       Serial.print(F("  motors ")); Serial.print(d); break;
+      case EV_BLOCKED: Serial.print(F("BLOCKED "));
+                       if (b == BY_LEFT) Serial.print(F("left corner "));
+                       else if (b == BY_RIGHT) Serial.print(F("right corner "));
+                       else if (b == BY_LOST_ECHO) Serial.print(F("echo lost, was "));
+                       else Serial.print(F("ahead "));
+                       printCm(a); break;
       case EV_LOOKED:  Serial.print(F("looked  left ")); printCm(a);
                        Serial.print(F("  right ")); printCm(b); break;
       case EV_BACKUP:  Serial.print(F("BACKUP")); break;
       case EV_TURN:    Serial.print(F("TURN ")); Serial.print(a ? F("left ") : F("right "));
                        Serial.print(b * 10); Serial.print(F("ms")); break;
       case EV_END:     Serial.print(F("END auto")); break;
+      case EV_NUDGE:   Serial.print(F("nudge away from ")); Serial.print(b ? F("left ") : F("right "));
+                       printCm(a); break;
+      case EV_VERIFY:  Serial.print(F("check ahead ")); printCm(a);
+                       Serial.print(a >= CLEAR_CM ? F("  clear") : F("  still blocked"));
+                       Serial.print(F(" (try ")); Serial.print(b); Serial.print(')'); break;
+      case EV_STUCK:   Serial.print(F("STUCK ahead ")); printCm(a); break;
     }
     Serial.println();
   }
@@ -147,6 +193,7 @@ void printLog() {
 // ---- servo ----
 
 void lookAt(int angle) {
+  servoAngle = angle;
   look.write(angle);
   if (!look.attached()) look.attach(SERVO_PIN);
   servoReleaseAt = millis() + 700;
@@ -170,6 +217,16 @@ void stopNow() {
   joyX = joyY = 0;
   targetL = targetR = curL = curR = 0;
   left(0); right(0);
+}
+
+// Stop hard: both direction pins low with full enable shorts each motor
+// (L298N "fast motor stop"), so the car doesn't roll on into what it saw.
+void brakeNow() {
+  stopNow();
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 255); analogWrite(ENB, 255);
+  brakeUntil = millis() + BRAKE_MS;
 }
 
 // Move cur toward target, faster when slowing down. Starting from rest jumps
@@ -217,7 +274,7 @@ long readDistanceCm() {
   digitalWrite(TRIG, LOW);  delayMicroseconds(2);
   digitalWrite(TRIG, HIGH); delayMicroseconds(10);
   digitalWrite(TRIG, LOW);
-  long us = pulseIn(ECHO, HIGH, 25000);
+  long us = pulseInLong(ECHO, HIGH, 25000);
   if (us == 0) return 999;  // no echo = nothing in range
   long cm = us / 58;
   return cm < 2 ? 0 : cm;
@@ -262,10 +319,9 @@ void setMode(bool on) {
     logEvent(EV_END);
   }
   autoMode = on;
-  step = CRUISE;
-  closeCount = 0;
   stopNow();
   lookAt(LOOK_CENTER);
+  startCruise(millis());
   say(on ? "MODE auto" : "MODE manual");
 }
 
@@ -324,6 +380,26 @@ void feed(LineIn &in, char c) {
 
 // ---- self-driving ----
 
+void startCruise(unsigned long now) {
+  step = CRUISE;
+  sweepIdx = 0;
+  aheadCm = sideLeftCm = sideRightCm = 999;
+  lostEchoes = 0;
+  stuckRefCm = 999;
+  stuckSince = lastSampleAt = now;
+}
+
+// Stop and look both ways (the servo is already somewhere in its sweep).
+void blocked(long cm, byte why, unsigned long now) {
+  frontCm = cm;
+  brakeNow();
+  logEvent(EV_BLOCKED, cmByte(cm), why);
+  verifyTry = 0;
+  lookAt(LOOK_LEFT);
+  step = LOOKING_LEFT;
+  stepUntil = now + LOOK_SETTLE_MS;
+}
+
 void startTurn(unsigned long now) {
   unsigned long ms = bothBlocked ? UTURN_MS : TURN_MS;
   setTargets(turnLeft ? -100 : 100, 0, AUTO_MAX_PWM);
@@ -332,24 +408,61 @@ void startTurn(unsigned long now) {
   stepUntil = now + ms;
 }
 
+void startBackup(unsigned long now) {
+  setTargets(0, -100, AUTO_MAX_PWM);
+  logEvent(EV_BACKUP);
+  step = BACKUP;
+  stepUntil = now + BACKUP_MS;
+}
+
+// One reading from the sweep while driving. angle > 90 is the left side.
+void cruiseSaw(int angle, long cm, unsigned long now) {
+  if (angle == LOOK_CENTER) {
+    if (cm >= 999) {
+      // No echo. Indoors that usually means a slanted or soft surface, not
+      // open space - if something was close a moment ago, don't trust it.
+      if (aheadCm < SUSPECT_CM && ++lostEchoes >= 2) { blocked(aheadCm, BY_LOST_ECHO, now); return; }
+      stuckRefCm = 999; stuckSince = now;  // no echo tells us nothing about being stuck
+      return;
+    }
+    lostEchoes = 0;
+    aheadCm = cm;
+    if (cm < AVOID_CM) { blocked(cm, BY_AHEAD, now); return; }
+    if (abs(cm - stuckRefCm) > STUCK_CHANGE_CM) { stuckRefCm = cm; stuckSince = now; }
+    else if (now - stuckSince > STUCK_MS) {
+      logEvent(EV_STUCK, cmByte(cm));
+      brakeNow();
+      bothBlocked = true;  // back up, then turn about
+      turnLeft = sideLeftCm > sideRightCm;
+      startBackup(now);
+    }
+    return;
+  }
+
+  bool onLeft = angle > LOOK_CENTER;
+  (onLeft ? sideLeftCm : sideRightCm) = cm;
+  if (cm < SIDE_STOP_CM) { blocked(cm, onLeft ? BY_LEFT : BY_RIGHT, now); return; }
+  if (cm < SIDE_NUDGE_CM) {
+    logEvent(EV_NUDGE, cmByte(cm), onLeft);
+    setTargets(onLeft ? 100 : -100, 0, AUTO_MAX_PWM);  // spin away from it, briefly
+    step = NUDGE;
+    stepUntil = now + NUDGE_MS;
+  }
+}
+
 void runAuto(unsigned long now) {
-  int top = min(maxSpeed, AUTO_MAX_PWM);
   switch (step) {
-    case CRUISE:
-      if (closeCount >= 2) {
-        frontCm = distance;
-        stopNow();
-        logEvent(EV_BLOCKED, cmByte(frontCm));
-        lookAt(LOOK_LEFT);
-        step = LOOKING_LEFT;
-        stepUntil = now + LOOK_SETTLE_MS;
-      } else {
-        setTargets(0, 100, top);
-        if (now - lastSampleAt >= 1000) {
-          lastSampleAt = now;
-          logEvent(EV_CRUISE, cmByte(distance), abs(curL), abs(curR));
-        }
+    case CRUISE: {
+      int top = min(maxSpeed, aheadCm < SLOW_CM || lostEchoes ? AUTO_SLOW_PWM : AUTO_MAX_PWM);
+      setTargets(0, 100, top);
+      if (now - lastSampleAt >= 1000) {
+        lastSampleAt = now;
+        logEvent(EV_CRUISE, cmByte(aheadCm), cmByte(sideLeftCm), cmByte(sideRightCm), abs(curL));
       }
+      break;
+    }
+    case NUDGE:
+      if (now >= stepUntil) step = CRUISE;  // keeps sweeping from where it was
       break;
     case LOOKING_LEFT:
       if (now >= stepUntil) {
@@ -367,14 +480,8 @@ void runAuto(unsigned long now) {
         turnLeft = leftCm > rightCm;
         bothBlocked = max(leftCm, rightCm) < AVOID_CM;
         now = millis();
-        if (bothBlocked || frontCm < BACKUP_CM) {
-          setTargets(0, -100, top);
-          logEvent(EV_BACKUP);
-          step = BACKUP;
-          stepUntil = now + BACKUP_MS;
-        } else {
-          startTurn(now);
-        }
+        if (bothBlocked || frontCm < BACKUP_CM) startBackup(now);
+        else startTurn(now);
       }
       break;
     case BACKUP:
@@ -382,10 +489,30 @@ void runAuto(unsigned long now) {
       break;
     case TURN:
       if (now >= stepUntil) {
-        stopNow();
-        closeCount = 0;
-        lastSampleAt = now;
-        step = CRUISE;
+        brakeNow();
+        lookAt(LOOK_CENTER);
+        step = VERIFY;
+        stepUntil = now + LOOK_SETTLE_MS;
+      }
+      break;
+    case VERIFY:
+      // Don't drive off after a turn without looking: the old code turned
+      // straight into the next obstacle.
+      if (now >= stepUntil) {
+        long cm = readSteadyCm();
+        verifyTry++;
+        logEvent(EV_VERIFY, cmByte(cm), verifyTry);
+        now = millis();
+        if (cm >= CLEAR_CM) {
+          startCruise(now);
+        } else if (verifyTry < VERIFY_TRIES) {
+          bothBlocked = false;  // a bit more the same way
+          startTurn(now);
+        } else {
+          verifyTry = 0;        // boxed in: back out and turn about
+          bothBlocked = true;
+          startBackup(now);
+        }
       }
       break;
   }
@@ -417,19 +544,29 @@ void loop() {
   while (bt.available()) feed(btLine, bt.read());
 
   unsigned long now = millis();
+  bool sweeping = autoMode && step == CRUISE;
 
-  if (now - lastPingAt >= 100) {
+  if (now - lastPingAt >= (sweeping ? SWEEP_PING_MS : 100)) {
     lastPingAt = now;
     long cm = readDistanceCm();
-    if (cm != 0) {  // skip noise, keep the last good reading
-      distance = cm;
-      if (autoMode && step == CRUISE) closeCount = distance < AVOID_CM ? closeCount + 1 : 0;
+    int angle = servoAngle;
+    if (cm != 0 && angle == LOOK_CENTER) distance = cm;  // skip noise, keep the last good reading
+    if (sweeping) {
+      if (cm != 0) cruiseSaw(angle, cm, now);
+      if (step == CRUISE) {
+        sweepIdx = (sweepIdx + 1) % SWEEP_LEN;
+        lookAt(SWEEP[sweepIdx]);
+        // Report right as the servo starts moving: SoftwareSerial blocks
+        // interrupts while sending, which can twitch the servo, and it has
+        // a whole ping interval to settle before the next reading.
+        if (angle == LOOK_CENTER) { lastReportAt = now; say("D " + String(distance)); }
+      }
     }
     if (!autoMode) applyJoystick();  // re-check the forward guard
   }
 
   // Report less often than we measure: SoftwareSerial can't receive while it sends.
-  if (now - lastReportAt >= 200) {
+  if (!sweeping && now - lastReportAt >= 200) {
     lastReportAt = now;
     say("D " + String(distance));
   }
@@ -446,7 +583,9 @@ void loop() {
   }
 
   int dt = now - lastRampAt;
-  if (dt > 0) {
+  if (now < brakeUntil) {
+    lastRampAt = now;  // hold the brake; the ramp starts from rest afterwards
+  } else if (dt > 0) {
     lastRampAt = now;
     curL = approach(curL, targetL, dt);
     curR = approach(curR, targetR, dt);
