@@ -77,7 +77,11 @@
   .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .actions button { padding: 16px 10px; font-weight: 700; }
   #stopBtn { background: var(--stop); border-color: var(--stop); color: #fff; font-size: 17px; }
-  #autoBtn.on { background: var(--warn); border-color: var(--warn); color: #1d1400; }
+  #autoBtn.on, #homeBtn.on { background: var(--warn); border-color: var(--warn); color: #1d1400; }
+  .trip { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+  .trip .mbar { flex: 1; }
+  .trip .mbar span { left: 0; }
+  #tripMsg { color: var(--warn); font-size: 13px; text-align: center; min-height: 18px; margin: 0; }
 
   .speed { display: grid; gap: 8px; }
   .speed .row { display: flex; justify-content: space-between; }
@@ -126,7 +130,11 @@
   <div class="actions">
     <button id="stopBtn">STOP</button>
     <button id="autoBtn">Self-drive</button>
+    <button id="homeBtn">🏠 Go home</button>
+    <button id="setHomeBtn">📍 Start here</button>
   </div>
+  <div class="trip"><span>Trip memory</span><div class="mbar"><span id="tripBar"></span></div><output id="tripVal">–</output></div>
+  <p id="tripMsg"></p>
 
   <section class="panel speed">
     <div class="row"><span class="label">Max speed</span><span id="speedVal">4</span></div>
@@ -147,7 +155,7 @@ const $ = id => document.getElementById(id);
 // ---------- connection ----------
 // The car link is either the USB cable (Web Serial) or the BLE module (Web Bluetooth).
 // Both look the same to the rest of the page: send(text), close(), and lines arrive via onData().
-let link = null, live = false, buffer = '', autoOn = false, wakeLock = null;
+let link = null, live = false, buffer = '', autoOn = false, homeOn = false, wakeLock = null;
 
 const BLE_SERVICE = 0xffe0, BLE_CHAR = 0xffe1;  // standard serial service on HM-10 style modules
 
@@ -162,7 +170,7 @@ function setConnected(on) {
   $('connectUsb').hidden = on || !!link || !('serial' in navigator);
   $('disconnect').hidden = !on && !link;
   if (on) keepScreenOn();
-  if (!on) { $('cm').textContent = '–'; $('bar').style.width = 0; $('warning').textContent = ''; setAuto(false); }
+  if (!on) { $('cm').textContent = '–'; $('bar').style.width = 0; $('warning').textContent = ''; setAuto(false); setHome(false); }
 }
 
 function send(text) {
@@ -304,6 +312,22 @@ function handleLine(line) {
     showDistance(parseInt(line.slice(2), 10));
   } else if (line.startsWith('MODE ')) {
     setAuto(line === 'MODE auto');
+    setHome(line === 'MODE home');
+  } else if (line.startsWith('TRIP ')) {
+    const pct = parseInt(line.slice(5), 10);
+    if (Number.isNaN(pct)) return;
+    $('tripVal').textContent = pct + '%';
+    $('tripBar').style.width = pct + '%';
+    $('tripBar').style.background = pct >= 100 ? 'var(--stop)' : pct > 80 ? 'var(--warn)' : 'var(--go)';
+  } else if (line === 'HOME done') {
+    $('tripMsg').textContent = 'Back at the start 🏁';
+    if (navigator.vibrate) navigator.vibrate([80, 60, 80]);
+  } else if (line === 'HOME too far') {
+    $('tripMsg').textContent = 'Trip too long to retrace — trip memory is full';
+  } else if (line === 'HOME already') {
+    $('tripMsg').textContent = "It hasn't moved since the start";
+  } else if (line === 'PATH FULL') {
+    $('tripMsg').textContent = 'Trip memory full — Go home won\'t work for this trip';
   }
 }
 
@@ -354,7 +378,7 @@ function joyMessage() {
 }
 
 function pushJoystick(keepalive) {
-  if (!live || autoOn) return;
+  if (!live || autoOn || homeOn) return;
   if (stickX === 0 && stickY === 0) return;
   const msg = joyMessage(), now = performance.now();
   if (msg === lastSent && !keepalive) return;
@@ -397,7 +421,7 @@ function stickFromPointer(e) {
 }
 
 $('stick').addEventListener('pointerdown', e => {
-  if (autoOn) return;
+  if (autoOn || homeOn) return;
   dragging = e.pointerId;
   $('stick').setPointerCapture(e.pointerId);
   $('knob').classList.remove('home');
@@ -428,7 +452,7 @@ function applyKeys() {
 addEventListener('keydown', e => {
   if (e.key === ' ') { e.preventDefault(); stopNow(); return; }
   const k = keyName(e);
-  if (!k || autoOn) return;
+  if (!k || autoOn || homeOn) return;
   e.preventDefault();
   if (!keys.has(k)) { keys.add(k); applyKeys(); }
 });
@@ -453,11 +477,21 @@ function setAuto(on) {
   if (on) { keys.clear(); centerStick(); }
 }
 
+function setHome(on) {
+  homeOn = on;
+  $('homeBtn').classList.toggle('on', on);
+  $('homeBtn').textContent = on ? 'Going home… (tap to stop)' : '🏠 Go home';
+  $('stick').classList.toggle('disabled', on || autoOn);
+  if (on) { keys.clear(); centerStick(); $('tripMsg').textContent = ''; }
+}
+
 $('stopBtn').addEventListener('pointerdown', stopNow);
 $('connectUsb').addEventListener('click', connectUsb);
 $('connectBt').addEventListener('click', connectBt);
 $('disconnect').addEventListener('click', disconnect);
 $('autoBtn').addEventListener('click', () => { centerStick(); send(autoOn ? 'M' : 'A'); });
+$('homeBtn').addEventListener('click', () => { centerStick(); send(homeOn ? 'S' : 'H'); });
+$('setHomeBtn').addEventListener('click', () => { send('P'); $('tripMsg').textContent = 'Start point set here 📍'; });
 $('speed').addEventListener('input', e => { $('speedVal').textContent = e.target.value; send(e.target.value); });
 
 // Switching apps, tabs or windows must never leave the car driving.

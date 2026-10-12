@@ -5,7 +5,9 @@
 //                               (the sum is a check: SoftwareSerial can drop bytes)
 //            S stop   0..9 max speed   A auto (obstacle avoid)   M manual
 //            G print the trip log (USB only)   V look test: left, right, ahead (manual only)
-// Reports:   "D <cm>" distance (999 = nothing in range), "MODE auto|manual", "READY"
+//            H go back to the start   P make this spot the start
+// Reports:   "D <cm>" distance (999 = nothing in range), "MODE auto|manual|home", "READY",
+//            "TRIP <percent of the trip memory used>", "HOME done|too far|already", "PATH FULL"
 //
 // Safety: in manual mode the car stops if no command arrives for 400 ms
 // (the remote repeats the joystick position while it is held), and it won't
@@ -20,6 +22,14 @@
 // before driving on. If the distance stops changing while driving, it's stuck:
 // back up and turn round. Everything it does is written to EEPROM (the trip log)
 // so a run can be read back over USB afterwards with G.
+//
+// Going home: there's no compass or wheel counter, so the car records every
+// motor command (and how long it lasted) since power-on or P, and H plays the
+// list backwards with each command reversed - forward 2 s becomes backward 2 s,
+// spin right becomes spin left. Slip on the same floor at the same power is
+// much the same both ways, so most of the error cancels, and it retraces a path
+// it already drove. The sensor faces forward, so reversing is blind; forward
+// stretches stop short of anything under HOME_GUARD_CM.
 
 #include <SoftwareSerial.h>
 #include <Servo.h>
@@ -33,7 +43,8 @@ const int TRIG = A1, ECHO = A2;
 const int BT_RX = 8, BT_TX = 9;  // to Bluetooth TXD, RXD
 const int SERVO_PIN = 10;        // turns the ultrasonic sensor
 
-const int GUARD_CM = 15;     // manual: block forward when closer than this
+const int GUARD_CM = 15;     // manual: block forward when closer than this when slow...
+const int GUARD_FAST_CM = 45;  // ...growing to this at full speed (it needs room to stop)
 const int AVOID_CM = 40;     // auto: stop and look when something ahead is closer than this
 const int BACKUP_CM = 15;    // auto: back up first when closer than this
 const int CLEAR_CM = 50;     // auto: after a turn, ahead must be at least this clear
@@ -84,6 +95,8 @@ unsigned long lastPingAt = 0, lastReportAt = 0, lastRampAt = 0;
 unsigned long servoReleaseAt = 0;  // detach after moving so it doesn't jitter
 int servoAngle = 90;
 unsigned long brakeUntil = 0;
+bool guardOn = false;          // manual forward guard is holding the car back
+byte lostRun = 0;              // no-echo readings in a row after something close
 
 int joyX = 0, joyY = 0;      // last joystick position, -100..100
 int targetL = 0, targetR = 0;  // signed PWM the motors are heading to
@@ -118,8 +131,8 @@ unsigned long stuckSince = 0;
 // slot: run, event, tenths of a second since auto started (2 bytes), a, b, c, d
 
 enum LogEvent : byte { EV_START = 1, EV_CRUISE, EV_BLOCKED, EV_LOOKED, EV_BACKUP, EV_TURN, EV_END,
-                       EV_NUDGE, EV_VERIFY, EV_STUCK, EV_BOOST };
-const byte EV_LAST = EV_BOOST;
+                       EV_NUDGE, EV_VERIFY, EV_STUCK, EV_BOOST, EV_BOOT };
+const byte EV_LAST = EV_BOOT;
 enum BlockReason : byte { BY_AHEAD, BY_LEFT, BY_RIGHT, BY_LOST_ECHO };
 const byte LOG_MAGIC = 0xA8;  // changed for auto v3: wipes the old-format log once
 const int LOG_START = 8, LOG_SLOT = 8;
@@ -193,10 +206,69 @@ void printLog() {
                        Serial.print(F(" (try ")); Serial.print(b); Serial.print(')'); break;
       case EV_STUCK:   Serial.print(F("STUCK ahead ")); printCm(a); break;
       case EV_BOOST:   Serial.print(F("didn't rotate -> turn power ")); Serial.print(a); break;
+      case EV_BOOT:    Serial.print(F("ARDUINO RESTARTED (power-on, USB plug-in, or a power/ground glitch)")); break;
     }
     Serial.println();
   }
   Serial.println(F("LOG END"));
+}
+
+// ---- trip memory (for going home) ----
+
+struct Move { int8_t l, r; uint8_t t; };  // motor targets / 2, how long in 20 ms units
+const int PATH_MAX = 220;
+const int8_t BRAKED = -128;               // l of a stop that braked rather than rolled
+const unsigned long HOME_STOP_MS = 300;   // stops are replayed this long at most
+const int HOME_GUARD_CM = 10;
+Move path[PATH_MAX];
+int pathLen = 0;
+bool pathFull = false;
+Move seg;                                 // the move happening now, not stored yet
+unsigned long segStart = 0;
+bool segOpen = false;
+
+bool homing = false;
+int homeIdx = 0;
+unsigned long homeUntil = 0;
+
+// close enough to count as the same move (cruise 65 vs 75 is not)
+bool sameMove(int8_t a, int8_t b) {
+  return (a > 0) == (b > 0) && (a < 0) == (b < 0) && abs(a - b) <= 3;
+}
+
+void closeMove(unsigned long now) {
+  if (!segOpen) return;
+  segOpen = false;
+  unsigned long t = (now - segStart + 10) / 20;
+  if (t == 0) return;
+  bool stop = seg.l == 0 || seg.l == BRAKED;
+  // standing still before the first move, or a stop after a stop, changes nothing
+  if (stop && (pathLen == 0 || path[pathLen - 1].l == 0 || path[pathLen - 1].l == BRAKED)) return;
+  if (pathLen >= PATH_MAX) {
+    if (!pathFull) say("PATH FULL");
+    pathFull = true;
+    return;
+  }
+  seg.t = t;
+  path[pathLen++] = seg;
+}
+
+void recordMotors(unsigned long now) {
+  if (homing || pathFull) return;
+  int8_t l = targetL / 2, r = targetR / 2;
+  if (l == 0 && r == 0 && now < brakeUntil) l = BRAKED;
+  if (segOpen && now - segStart < 255UL * 20 &&
+      (l == BRAKED ? seg.l == BRAKED : sameMove(l, seg.l) && sameMove(r, seg.r))) return;
+  closeMove(now);
+  seg.l = l; seg.r = r;
+  segStart = now;
+  segOpen = true;
+}
+
+void clearPath() {
+  pathLen = 0;
+  pathFull = false;
+  segOpen = false;
 }
 
 // ---- servo ----
@@ -270,9 +342,24 @@ void setTargets(int x, int y, int topPwm) {
   targetR = toPwm(r, minPwm, topPwm);
 }
 
+// how close is too close depends on how fast it's going
+int guardCm() {
+  int fwd = max(0, (curL + curR) / 2);
+  return GUARD_CM + (long)(GUARD_FAST_CM - GUARD_CM) * fwd / 255;
+}
+
 void applyJoystick() {
   int y = joyY;
-  if (y > 0 && distance < GUARD_CM) y = 0;  // no forward into an obstacle
+  bool block = y > 0 && distance < guardCm();
+  if (block) {
+    y = 0;  // no forward into an obstacle (turning away still works)
+    if (!guardOn && curL > 0 && curR > 0) {
+      int x = joyX;
+      brakeNow();  // stop hard rather than rolling on into it
+      joyX = x; joyY = 0;
+    }
+  }
+  guardOn = block;
   setTargets(joyX, y, maxSpeed);
 }
 
@@ -342,7 +429,7 @@ void handleJoystick(const char *msg) {
   int x, y, sum;
   if (sscanf(msg, "%d,%d,%d", &x, &y, &sum) != 3) return;
   if (sum != x + y || abs(x) > 100 || abs(y) > 100) return;  // garbled
-  if (autoMode) return;
+  if (autoMode || homing) return;
   joyX = x; joyY = y;
   lastCommandAt = millis();
   applyJoystick();
@@ -351,21 +438,28 @@ void handleJoystick(const char *msg) {
 void handleCommand(char c, bool fromUsb) {
   if (c >= '0' && c <= '9') {
     maxSpeed = map(c - '0', 0, 9, 80, 255);
-    if (!autoMode) applyJoystick();
+    if (!autoMode && !homing) applyJoystick();
     return;
   }
   switch (c) {
-    case 'A': setMode(true);  return;
-    case 'M': setMode(false); return;
+    case 'A': stopHome(); setMode(true);  return;
+    case 'M': stopHome(); setMode(false); return;
     case 'S':
-      if (autoMode) setMode(false);  // stop always wins
+      if (homing) stopHome();         // stop always wins
+      else if (autoMode) setMode(false);
       else stopNow();
+      return;
+    case 'H':
+      if (!homing) startHome();
+      return;
+    case 'P':
+      if (!homing) { clearPath(); say("TRIP 0"); }
       return;
     case 'G':
       if (fromUsb) printLog();  // too long for the Bluetooth link
       return;
     case 'V':
-      if (!autoMode) lookTest();
+      if (!autoMode && !homing) lookTest();
       return;
   }
 }
@@ -564,6 +658,59 @@ void runAuto(unsigned long now) {
   }
 }
 
+// ---- going home ----
+
+void startHome() {
+  if (autoMode) setMode(false);
+  stopNow();
+  closeMove(millis());
+  if (pathFull) { say("HOME too far"); return; }
+  if (pathLen == 0) { say("HOME already"); return; }
+  lookAt(LOOK_CENTER);
+  homing = true;
+  homeIdx = pathLen;
+  homeUntil = 0;
+  say("MODE home");
+}
+
+void stopHome() {
+  if (!homing) return;
+  homing = false;
+  stopNow();
+  // where it stopped is unknown, so the trip so far can't be undone any more
+  clearPath();
+  say("MODE manual");
+}
+
+void runHome(unsigned long now) {
+  bool forward = targetL > 0 && targetR > 0;
+  if (forward && distance < HOME_GUARD_CM) homeUntil = now;  // don't drive into it, skip ahead
+  if (now < homeUntil) return;
+  if (homeIdx == 0) {
+    brakeNow();
+    homing = false;
+    clearPath();  // here is the start again
+    say("HOME done");
+    say("MODE manual");
+    return;
+  }
+  Move m = path[--homeIdx];
+  unsigned long ms = m.t * 20UL;
+  if (m.l == BRAKED) { brakeNow(); ms = min(ms, HOME_STOP_MS); }
+  else if (m.l == 0 && m.r == 0) { stopNow(); ms = min(ms, HOME_STOP_MS); }
+  else { targetL = -m.l * 2; targetR = -m.r * 2; }
+  homeUntil = now + ms;
+}
+
+void report(unsigned long now) {
+  static unsigned long lastTripAt = 0;
+  say("D " + String(distance));
+  if (now - lastTripAt >= 2000) {
+    lastTripAt = now;
+    say("TRIP " + String(pathFull ? 100 : pathLen * 100L / PATH_MAX));
+  }
+}
+
 // ---- main ----
 
 void setup() {
@@ -575,6 +722,9 @@ void setup() {
   Serial.begin(9600);
   bt.begin(9600);
   logInit();
+  // a restart in the middle of a drive = power or ground trouble (one line per burst)
+  byte lastSlot = (EEPROM.read(1) + LOG_SLOTS - 1) % LOG_SLOTS;
+  if (EEPROM.read(LOG_START + lastSlot * LOG_SLOT + 1) != EV_BOOT) logEvent(EV_BOOT);
 
   // glance left then straight ahead, so you can see the servo works and which way is left
   lookAt(LOOK_CENTER); delay(400);
@@ -596,7 +746,12 @@ void loop() {
     lastPingAt = now;
     long cm = readDistanceCm();
     int angle = servoAngle;
-    if (cm != 0 && angle == LOOK_CENTER) distance = cm;  // skip noise, keep the last good reading
+    if (cm != 0 && angle == LOOK_CENTER) {  // skip noise, keep the last good reading
+      // An echo that vanishes right after something close is usually a wall at
+      // an angle bouncing the sound away, not open space: hold the close reading a while.
+      if (cm >= 999 && distance < SUSPECT_CM && lostRun < 8) lostRun++;
+      else { distance = cm; lostRun = 0; }
+    }
     if (sweeping) {
       if (cm != 0) cruiseSaw(angle, cm, now);
       if (step == CRUISE) {
@@ -605,16 +760,16 @@ void loop() {
         // Report right as the servo starts moving: SoftwareSerial blocks
         // interrupts while sending, which can twitch the servo, and it has
         // a whole ping interval to settle before the next reading.
-        if (angle == LOOK_CENTER) { lastReportAt = now; say("D " + String(distance)); }
+        if (angle == LOOK_CENTER) { lastReportAt = now; report(now); }
       }
     }
-    if (!autoMode) applyJoystick();  // re-check the forward guard
+    if (!autoMode && !homing) applyJoystick();  // re-check the forward guard
   }
 
   // Report less often than we measure: SoftwareSerial can't receive while it sends.
   if (!sweeping && now - lastReportAt >= 200) {
     lastReportAt = now;
-    say("D " + String(distance));
+    report(now);
   }
 
   if (servoReleaseAt && now >= servoReleaseAt) {
@@ -622,12 +777,15 @@ void loop() {
     look.detach();
   }
 
-  if (autoMode) {
+  if (homing) {
+    runHome(now);
+  } else if (autoMode) {
     runAuto(now);
   } else if ((joyX || joyY) && now - lastCommandAt > COMMAND_TIMEOUT_MS) {
     stopNow();  // remote went quiet
   }
 
+  recordMotors(now);
   int dt = now - lastRampAt;
   if (now < brakeUntil) {
     lastRampAt = now;  // hold the brake; the ramp starts from rest afterwards
